@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+
+import os
+import time
+import requests
+import pandas as pd
+import certifi
+import torch
+from bs4 import BeautifulSoup
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from openpyxl import load_workbook
+from openpyxl.styles import Font, Alignment
+from tabulate import tabulate
+
+# ─── 0) NewsAPI key ──────────────────────────────────────────────────────────
+API_KEY = "620bfd3f7c4b46b08fe908dfff9033a3"
+
+# ─── 1) Pick the best device ─────────────────────────────────────────────────
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
+
+print(f"Using device: {device}")
+
+# ─── 2) Mute HF symlink warning ───────────────────────────────────────────────
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "TRUE"
+
+# ─── 3) Load FinBERT onto device ──────────────────────────────────────────────
+tokenizer = AutoTokenizer.from_pretrained("yiyanghkust/finbert-tone")
+model = AutoModelForSequenceClassification.from_pretrained(
+    "yiyanghkust/finbert-tone",
+    use_safetensors=True
+)
+if device.type == "cuda":
+    model = model.to(device).half()
+else:
+    model = model.to(device)
+
+sentiment = pipeline(
+    "sentiment-analysis",
+    model=model,
+    tokenizer=tokenizer,
+    device=0 if device.type == "cuda" else -1,
+    batch_size=16,
+    truncation=True
+)
+
+def get_sp500_watchlist():
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    r = requests.get(url, verify=certifi.where())
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    table = soup.find("table", id="constituents") or soup.find("table", class_="wikitable sortable")
+    headers = [c.get_text(strip=True) for c in table.find("tr").find_all(["th","td"])]
+    rows = []
+    for tr in table.find_all("tr")[1:]:
+        cols = tr.find_all("td")
+        if not cols:
+            continue
+        rows.append([cols[i].get_text(strip=True) for i in range(len(headers))])
+    df = pd.DataFrame(rows, columns=headers)
+    df["Symbol"] = df["Symbol"].str.replace(".", "-", regex=False)
+    return df.set_index("Symbol")
+
+def fetch_headlines(ticker, page_size=20):
+    params = {
+        "q":        ticker,
+        "pageSize": page_size,
+        "apiKey":   API_KEY,
+        "language": "en",
+        "sortBy":   "publishedAt",
+    }
+    r = requests.get("https://newsapi.org/v2/everything", params=params)
+    r.raise_for_status()
+    return [
+        f"{a['title']}. {a.get('description','')}"
+        for a in r.json().get("articles", [])
+        if a.get("title")
+    ]
+
+def score_headlines(headlines):
+    results = sentiment(headlines)
+    df = pd.DataFrame(results)
+    df["score"] = df["label"].str.lower().map({
+        "positive":  1,
+        "negative": -1,
+        "neutral":   0
+    }) * df["score"]
+    return df["score"].mean()
+
+def export_weighted_allocation(long_series, short_series, portfolio_value, companies,
+                               max_weight_pct=15, filename="portfolio_allocation.xlsx"):
+    def compute_weights(series):
+        scores = series.values
+        exp_scores = pd.Series(scores ** 2, index=series.index)
+        weights = exp_scores / exp_scores.sum()
+        weights = weights.clip(upper=max_weight_pct / 100)
+        return weights / weights.sum()
+
+    long_weights = compute_weights(long_series)
+    short_weights = compute_weights(short_series.abs())
+
+    long_alloc = (long_weights * portfolio_value / 2).round(2)
+    short_alloc = (short_weights * portfolio_value / 2).round(2)
+
+    long_df = pd.DataFrame({
+        "Position": "LONG",
+        "Ticker": long_series.index,
+        "Company": [companies.get(t, "") for t in long_series.index],
+        "Sentiment": long_series.values,
+        "Weight (%)": (long_weights * 100).round(2),
+        "Allocation ($)": long_alloc
+    })
+
+    short_df = pd.DataFrame({
+        "Position": "SHORT",
+        "Ticker": short_series.index,
+        "Company": [companies.get(t, "") for t in short_series.index],
+        "Sentiment": short_series.values,
+        "Weight (%)": (short_weights * 100).round(2),
+        "Allocation ($)": short_alloc
+    })
+
+    full_df = pd.concat([long_df, short_df], ignore_index=True)
+    total_row = pd.DataFrame([{
+        "Position": "TOTAL",
+        "Ticker": "",
+        "Company": "",
+        "Sentiment": "",
+        "Weight (%)": full_df["Weight (%)"].sum().round(2),
+        "Allocation ($)": full_df["Allocation ($)"].sum().round(2)
+    }])
+    full_df = pd.concat([full_df, total_row], ignore_index=True)
+
+    # Save to Excel
+    full_df.to_excel(filename, index=False)
+
+    # Plot allocation chart
+    plt.figure(figsize=(12,6))
+    colors = ['green' if x == "LONG" else 'red' for x in full_df["Position"].fillna("")]
+    plt.bar(full_df["Ticker"].fillna(""), full_df["Allocation ($)"].fillna(0), color=colors)
+    plt.title("Portfolio Allocation by Ticker (Top-Heavy Weighted)")
+    plt.ylabel("Allocation ($)")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig("allocation_chart.png")
+    plt.show()
+
+    print(f"\n✅ Portfolio allocation saved to '{filename}' and bar chart saved to 'allocation_chart.png'\n")
+    print(tabulate(full_df.dropna(), headers='keys', tablefmt='psql', showindex=False))
+
+def main():
+    sp500_df = get_sp500_watchlist()
+    watchlist = sp500_df.index.tolist()
+    company_lookup = sp500_df["Security"].to_dict()
+    signals = {}
+
+    for ticker in tqdm(watchlist, desc="Scoring tickers"):
+        try:
+            hl = fetch_headlines(ticker)
+            if hl:
+                signals[ticker] = score_headlines(hl)
+        except Exception:
+            continue
+
+    if not signals:
+        print("WOMP WOMP: NEWS API LIMIT REACHED. GET NEW NEWS API KEY.")
+        return
+
+    series   = pd.Series(signals, name="sentiment").sort_values(ascending=False)
+    top10    = series.head(10)
+    bottom10 = series.tail(10)
+    ts       = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    print(f"\n[{ts}] Top 10 LONG candidates:")
+    print(top10.to_string())
+    print(f"\n[{ts}] Top 10 SHORT candidates:")
+    print(bottom10.to_string())
+
+    try:
+        portfolio_value = float(input("\nEnter your total portfolio value: "))
+        export_weighted_allocation(top10, bottom10, portfolio_value, company_lookup)
+    except ValueError:
+        print("Invalid input. Please enter a number.")
+
+if __name__ == "__main__":
+    main()
